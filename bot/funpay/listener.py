@@ -98,16 +98,16 @@ class FunPayListener:
         ev_type = event.type
 
         if ev_type == FunPayAPI.events.EventTypes.NEW_ORDER:
-            order: FunPayAPI.types.OrderShortcut = event.order
+            order = event.order
             chat_id = order.buyer_id
-            description = f"{order.description} {order.short_description or ''}"
+            description = order.description or ""
             _chat_to_orders.setdefault(chat_id, []).append(order.id)
             asyncio.ensure_future(
                 self._on_new_order(order.id, chat_id, order.buyer_username, description)
             )
 
         elif ev_type == FunPayAPI.events.EventTypes.NEW_MESSAGE:
-            msg: FunPayAPI.types.Message = event.message
+            msg = event.message
             if msg.author_id == self._account.id:
                 return
             text = (msg.text or "").strip()
