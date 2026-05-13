@@ -46,20 +46,11 @@ async def main() -> None:
         notify_admin=notify_admin,
     )
 
-    # Order-confirm routing: map FunPay chat messages "Да" to processor
-    # We keep a chat → open order id map for quick lookup
-    _chat_order_map: dict[int, str] = {}
-
-    async def on_new_order(order_id: str, chat_id: int, buyer: str, desc: str) -> None:
-        _chat_order_map[chat_id] = order_id
-        await processor.handle_new_order(order_id, chat_id, buyer, desc)
-        _chat_order_map.pop(chat_id, None)
+    async def on_new_order(order_id: str, chat_id: int, buyer: str, desc: str, fields: dict) -> None:
+        await processor.handle_new_order(order_id, chat_id, buyer, desc, fields)
 
     async def on_buyer_message(chat_id: int, author: str, text: str) -> None:
-        if text.strip().lower() in ("да", "yes", "да."):
-            order_id = _chat_order_map.get(chat_id)
-            if order_id:
-                await processor.confirm_order(order_id)
+        await processor.handle_buyer_message(chat_id, text)
 
     loop = asyncio.get_event_loop()
     funpay_listener = FunPayListener(

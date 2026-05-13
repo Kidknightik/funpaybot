@@ -1,37 +1,32 @@
 """
-FunPay event listener — wraps FunPayAPI Runner and routes events
-to OrderProcessor.
+FunPay event listener.
+
+Runner.listen() is a synchronous infinite generator with internal time.sleep().
+We drive it correctly by calling get_updates() + parse_updates() in a thread
+every 6 seconds, then dispatching events on the async side.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-import os
+import time
 from pathlib import Path
 from typing import Callable, Awaitable
 
 from loguru import logger
 
-# FunPayAPI lives at repo root, add it to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import FunPayAPI
+from FunPayAPI.common.enums import EventTypes
 
 from config import settings
 
-# Mapping funpay chat_id → list of pending order ids (for confirm routing)
-_chat_to_orders: dict[int, list[str]] = {}
-
 
 class FunPayListener:
-    """
-    Runs FunPayAPI's Runner in a background thread (it's synchronous)
-    and bridges events to async handlers.
-    """
-
     def __init__(
         self,
-        on_new_order: Callable[[str, int, str, str], Awaitable[None]],
+        on_new_order: Callable[[str, int, str, str, dict], Awaitable[None]],
         on_buyer_message: Callable[[int, str, str], Awaitable[None]],
         loop: asyncio.AbstractEventLoop,
     ) -> None:
@@ -41,6 +36,8 @@ class FunPayListener:
         self._account: FunPayAPI.Account | None = None
         self._runner: FunPayAPI.Runner | None = None
         self._task: asyncio.Task | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def _build_account(self) -> FunPayAPI.Account:
         acc = FunPayAPI.Account(
@@ -60,53 +57,57 @@ class FunPayListener:
         if self._task:
             self._task.cancel()
 
+    # ── Public helpers ────────────────────────────────────────────────────────
+
     async def send_message(self, chat_id: int, text: str) -> None:
-        """Send a FunPay chat message from the async side."""
         if not self._account:
             return
         await asyncio.to_thread(
             self._account.send_message, chat_id, text, update_last_saved_message=True
         )
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    async def get_full_order(self, order_id: str) -> FunPayAPI.types.Order | None:
+        """Fetch full order data (including custom fields) from FunPay."""
+        try:
+            return await asyncio.to_thread(self._account.get_order, order_id)
+        except Exception as exc:
+            logger.error(f"Failed to fetch order {order_id}: {exc}")
+            return None
+
+    # ── Core loop ─────────────────────────────────────────────────────────────
 
     async def _listen_loop(self) -> None:
-        """Iterate runner events, dispatch to handlers."""
-        assert self._runner
+        """
+        Correct async driver for the synchronous Runner:
+        - call get_updates() in a thread (one HTTP request)
+        - parse events synchronously (fast, no I/O)
+        - dispatch async handlers
+        - sleep 6 s
+        """
         logger.info("FunPay listener started")
         while True:
             try:
-                events = await asyncio.to_thread(self._runner_poll)
+                updates = await asyncio.to_thread(self._runner.get_updates)
+                events  = self._runner.parse_updates(updates)
                 for event in events:
                     await self._dispatch(event)
+                await asyncio.sleep(6)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.exception(f"FunPay listener error: {exc}")
-                await asyncio.sleep(5)
-
-    def _runner_poll(self) -> list:
-        """Synchronous call that returns a batch of events."""
-        events = []
-        for event in self._runner.listen():
-            events.append(event)
-            if len(events) >= 50:
-                break
-        return events
+                await asyncio.sleep(10)
 
     async def _dispatch(self, event) -> None:
         ev_type = event.type
 
-        if ev_type == FunPayAPI.events.EventTypes.NEW_ORDER:
+        if ev_type == EventTypes.NEW_ORDER:
             order = event.order
-            chat_id = order.buyer_id
-            description = order.description or ""
-            _chat_to_orders.setdefault(chat_id, []).append(order.id)
-            asyncio.ensure_future(
-                self._on_new_order(order.id, chat_id, order.buyer_username, description)
-            )
+            logger.info(f"New order #{order.id} from {order.buyer_username}")
+            # Fetch full order in background to get custom fields
+            asyncio.ensure_future(self._handle_new_order(order))
 
-        elif ev_type == FunPayAPI.events.EventTypes.NEW_MESSAGE:
+        elif ev_type == EventTypes.NEW_MESSAGE:
             msg = event.message
             if msg.author_id == self._account.id:
                 return
@@ -114,5 +115,34 @@ class FunPayListener:
             if not text:
                 return
             asyncio.ensure_future(
-                self._on_buyer_message(msg.chat_id, msg.author, text)
+                self._on_buyer_message(msg.chat_id, msg.author or "", text)
             )
+
+    async def _handle_new_order(self, shortcut: FunPayAPI.types.OrderShortcut) -> None:
+        """
+        Fetches the full Order object so we have access to custom fields
+        (e.g. "TELEGRAM USERNAME"), then calls the on_new_order handler.
+        """
+        full_order = await self.get_full_order(shortcut.id)
+        fields: dict = {}
+        description = shortcut.description or ""
+
+        if full_order:
+            fields = full_order.fields or {}
+            # Combine short + full descriptions for parsing
+            parts = [
+                shortcut.description or "",
+                full_order.short_description or "",
+                full_order.full_description or "",
+            ]
+            description = " | ".join(p for p in parts if p)
+            logger.debug(f"Order #{shortcut.id} fields: {fields}")
+            logger.debug(f"Order #{shortcut.id} description: {description}")
+
+        await self._on_new_order(
+            shortcut.id,
+            shortcut.buyer_id,
+            shortcut.buyer_username,
+            description,
+            fields,
+        )
