@@ -16,6 +16,7 @@ from database import init_db
 from fragment import FragmentManager
 from bot.funpay import FunPayListener, OrderProcessor
 from bot.telegram import create_bot, create_dispatcher, notify_admins
+from bot.telegram.handlers.admin_handler import set_fragment_manager
 
 
 async def main() -> None:
@@ -30,6 +31,7 @@ async def main() -> None:
 
     fragment = FragmentManager()
     await fragment.start()
+    set_fragment_manager(fragment)   # make manager available to Telegram handlers
 
     # Notification helper for both FunPay chat and Telegram admin
     async def send_funpay_message(chat_id: int, text: str) -> None:

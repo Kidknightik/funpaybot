@@ -10,6 +10,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+        InlineKeyboardButton(text="🔍 Статус Fragment", callback_data="fragment_status"),
     )
     return builder.as_markup()
 

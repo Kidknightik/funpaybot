@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -10,6 +12,14 @@ from database import AsyncSessionFactory, OrderRepository, OrderStatus
 from bot.telegram.keyboards import main_menu_kb, settings_kb, back_kb
 
 router = Router()
+
+# Injected by main.py after FragmentManager is created
+_fragment_manager = None
+
+
+def set_fragment_manager(mgr) -> None:
+    global _fragment_manager
+    _fragment_manager = mgr
 
 _WELCOME = (
     "👋 <b>FunPay Star/Premium Bot</b>\n"
@@ -21,6 +31,26 @@ _WELCOME = (
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     await message.answer(_WELCOME, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    """Re-check Fragment session and report to admin."""
+    if _fragment_manager is None:
+        await message.answer("⏳ Fragment менеджер ещё не запущен.")
+        return
+
+    wait_msg = await message.answer("🔄 Проверяю состояние Fragment...")
+    try:
+        info = await _fragment_manager.refresh_session()
+        await wait_msg.edit_text(
+            f"<b>Состояние Fragment</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{info}",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await wait_msg.edit_text(f"❌ Ошибка проверки: {exc}")
 
 
 @router.callback_query(F.data == "main_menu")
@@ -65,6 +95,30 @@ async def cb_stats(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     await cb.answer()
+
+
+@router.callback_query(F.data == "fragment_status")
+async def cb_fragment_status(cb: CallbackQuery) -> None:
+    if _fragment_manager is None:
+        await cb.answer("Fragment менеджер не запущен", show_alert=True)
+        return
+
+    await cb.answer("Проверяю...", show_alert=False)
+    try:
+        info = await _fragment_manager.refresh_session()
+        await cb.message.edit_text(
+            f"<b>Состояние Fragment</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{info}\n\n"
+            f"<i>Нажмите кнопку снова для обновления</i>",
+            reply_markup=back_kb(),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await cb.message.edit_text(
+            f"❌ Ошибка проверки: {exc}",
+            reply_markup=back_kb(),
+        )
 
 
 @router.callback_query(F.data.startswith("set_"))
