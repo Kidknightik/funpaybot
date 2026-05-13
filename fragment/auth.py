@@ -13,44 +13,58 @@ from config import settings
 
 SESSION_DIR: Path = settings.BROWSER_DATA_DIR / "fragment_session"
 
+# Fragment's actual button selectors (from DOM inspection)
+_SELECTOR_CONNECT_TG  = "button.login-link"          # "Connect Telegram"
+_SELECTOR_CONNECT_TON = "button.ton-auth-link"        # "Connect TON"
+
 
 @dataclass
 class FragmentSessionInfo:
-    logged_in: bool
-    wallet_connected: bool
+    logged_in: bool           # Telegram account connected
+    wallet_connected: bool    # TON wallet connected
     wallet_address: Optional[str] = None
     tg_username: Optional[str] = None
     ton_balance: Optional[str] = None
 
+    @property
+    def fully_ready(self) -> bool:
+        return self.logged_in and self.wallet_connected
+
     def __str__(self) -> str:
-        if not self.logged_in:
-            return "❌ Не авторизован на Fragment"
-        lines = ["✅ Fragment авторизован"]
-        if self.tg_username:
-            lines.append(f"👤 Telegram: @{self.tg_username}")
-        if self.wallet_connected and self.wallet_address:
-            short = self.wallet_address[:6] + "…" + self.wallet_address[-4:]
-            lines.append(f"💎 Кошелёк: {short}")
-            if self.ton_balance:
-                lines.append(f"💰 Баланс: {self.ton_balance} TON")
+        lines = []
+        # Telegram
+        if self.logged_in:
+            tg = f"@{self.tg_username}" if self.tg_username else "подключён"
+            lines.append(f"✅ Telegram: {tg}")
         else:
-            lines.append("⚠️  TON кошелёк не подключён")
+            lines.append("❌ Telegram: не подключён")
+
+        # TON wallet
+        if self.wallet_connected and self.wallet_address:
+            short = self.wallet_address[:8] + "…" + self.wallet_address[-4:]
+            lines.append(f"✅ TON кошелёк: <code>{short}</code>")
+            if self.ton_balance:
+                lines.append(f"💰 Баланс: <b>{self.ton_balance} TON</b>")
+        elif self.logged_in:
+            lines.append("⚠️  TON кошелёк: не подключён")
+        else:
+            lines.append("⚠️  TON кошелёк: не подключён")
+
         return "\n".join(lines)
 
 
 async def get_browser_context(playwright):
     """
     Returns a persistent Playwright BrowserContext with saved Fragment session.
-    On first run the user must log in manually; the session is then reused.
+    On first run the user must log in manually in the opened window.
     """
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
-
     proxy_settings = {"server": settings.FRAGMENT_PROXY} if settings.FRAGMENT_PROXY else None
 
     context = await playwright.chromium.launch_persistent_context(
         str(SESSION_DIR),
         channel="msedge",
-        headless=False,
+        headless=False,    # keep visible so admin can log in on first run
         proxy=proxy_settings,
         viewport={"width": 1280, "height": 800},
         user_agent=(
@@ -66,87 +80,140 @@ async def get_browser_context(playwright):
 
 async def check_session(page: Page) -> FragmentSessionInfo:
     """
-    Full Fragment session check:
-    - Is user logged in?
-    - Is TON wallet connected?
-    - What's the wallet address and balance?
+    Full Fragment session check using correct DOM selectors.
+
+    Fragment state machine:
+      - Both 'Connect Telegram' + 'Connect TON' visible  → not logged in at all
+      - Only 'Connect TON' visible                        → TG connected, no wallet
+      - Neither button visible                            → fully connected
     """
     try:
-        await page.goto("https://fragment.com/", timeout=20_000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2500)
+        await page.goto(
+            "https://fragment.com/",
+            timeout=25_000,
+            wait_until="domcontentloaded",
+        )
+        # Wait for JS to render auth state
+        await page.wait_for_timeout(3000)
     except Exception as exc:
         logger.warning(f"Fragment page load failed: {exc}")
         return FragmentSessionInfo(logged_in=False, wallet_connected=False)
 
     try:
-        content = await page.content()
+        has_connect_tg  = await page.locator(_SELECTOR_CONNECT_TG).count()  > 0
+        has_connect_ton = await page.locator(_SELECTOR_CONNECT_TON).count() > 0
 
-        # ── Check login state ─────────────────────────────────────────────────
-        # Fragment shows "Sign In" / "Log in" button when not authenticated
-        sign_in_btn = page.locator("a.tm-section-header-login, button:has-text('Log in'), a:has-text('Sign In')")
-        has_sign_in = await sign_in_btn.count() > 0
-
-        if has_sign_in:
+        # ── Not logged in at all ──────────────────────────────────────────────
+        if has_connect_tg:
             return FragmentSessionInfo(logged_in=False, wallet_connected=False)
 
-        # ── Extract Telegram username ──────────────────────────────────────────
-        tg_username: Optional[str] = None
-        try:
-            # Fragment shows "@username" in the top user menu
-            user_el = page.locator(".tm-header-username, .header-username, [class*='username']").first
-            raw = (await user_el.inner_text(timeout=2000)).strip().lstrip("@")
-            if raw:
-                tg_username = raw
-        except Exception:
-            pass
+        # ── Telegram connected, checking TON wallet ───────────────────────────
+        tg_username = await _get_tg_username(page)
 
-        # ── Check wallet connection ───────────────────────────────────────────
-        wallet_address: Optional[str] = None
-        ton_balance: Optional[str] = None
-        wallet_connected = False
+        if has_connect_ton:
+            return FragmentSessionInfo(
+                logged_in=True,
+                wallet_connected=False,
+                tg_username=tg_username,
+            )
 
-        try:
-            # Fragment displays shortened wallet address (e.g. "UQ…abc") in header
-            wallet_el = page.locator(
-                "button[class*='wallet'], .tm-wallet-address, "
-                "[class*='wallet-address'], [class*='walletAddress']"
-            ).first
-            addr_text = (await wallet_el.inner_text(timeout=3000)).strip()
-            if addr_text and len(addr_text) > 4:
-                wallet_address = addr_text
-                wallet_connected = True
-        except Exception:
-            pass
-
-        # Fallback: check page source for TON address pattern
-        if not wallet_connected:
-            import re
-            ton_addr_re = re.compile(r'\b(UQ|EQ)[A-Za-z0-9_\-]{46}\b')
-            matches = ton_addr_re.findall(content)
-            if matches:
-                wallet_address = matches[0]
-                wallet_connected = True
-
-        # ── Extract balance ───────────────────────────────────────────────────
-        if wallet_connected:
-            try:
-                balance_el = page.locator(
-                    "[class*='balance'], [class*='ton-amount'], [class*='tonAmount']"
-                ).first
-                bal = (await balance_el.inner_text(timeout=2000)).strip()
-                if bal:
-                    ton_balance = bal
-            except Exception:
-                pass
+        # ── Fully connected — extract wallet info ─────────────────────────────
+        wallet_address = await _get_wallet_address(page)
+        ton_balance    = await _get_ton_balance(page)
 
         return FragmentSessionInfo(
             logged_in=True,
-            wallet_connected=wallet_connected,
-            wallet_address=wallet_address,
+            wallet_connected=True,
             tg_username=tg_username,
+            wallet_address=wallet_address,
             ton_balance=ton_balance,
         )
 
     except Exception as exc:
         logger.warning(f"Fragment session parse error: {exc}")
-        return FragmentSessionInfo(logged_in=True, wallet_connected=False)
+        return FragmentSessionInfo(logged_in=False, wallet_connected=False)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _get_tg_username(page: Page) -> Optional[str]:
+    """Extract Telegram username from the Fragment header (shown when TG connected)."""
+    # Fragment renders the TG username inside the header user-block
+    selectors = [
+        ".tm-header-userpic + * .tm-header-username",
+        "[class*='header-user'] [class*='username']",
+        ".tm-header-user .tm-username",
+        # generic: any short @username-like text in the header actions
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            text = (await el.inner_text(timeout=1500)).strip().lstrip("@")
+            if text:
+                return text
+        except Exception:
+            continue
+
+    # Fallback: check the page source for "@username" near the header area
+    try:
+        header_html = await page.locator("header").inner_html()
+        import re
+        m = re.search(r'@([A-Za-z0-9_]{5,32})', header_html)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
+    return None
+
+
+async def _get_wallet_address(page: Page) -> Optional[str]:
+    """Extract the connected TON wallet address from the Fragment header."""
+    import re
+    _TON_ADDR = re.compile(r'\b(UQ|EQ)[A-Za-z0-9_\-]{46}\b')
+
+    selectors = [
+        ".tm-header-wallet-address",
+        ".tm-wallet",
+        "[class*='wallet-addr']",
+        "[class*='walletAddr']",
+        ".tm-header-actions [class*='address']",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            text = (await el.inner_text(timeout=1500)).strip()
+            if text:
+                return text
+        except Exception:
+            continue
+
+    # Fallback: grep page source for TON address in header
+    try:
+        header_html = await page.locator("header").inner_html()
+        m = _TON_ADDR.search(header_html)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+
+    return None
+
+
+async def _get_ton_balance(page: Page) -> Optional[str]:
+    """Extract TON balance shown in the header after wallet connection."""
+    selectors = [
+        ".tm-header-balance",
+        "[class*='header-ton-balance']",
+        "[class*='tonBalance']",
+        ".tm-header-wallet .tm-value",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            text = (await el.inner_text(timeout=1500)).strip()
+            if text:
+                return text
+        except Exception:
+            continue
+    return None

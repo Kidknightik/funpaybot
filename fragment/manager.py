@@ -72,26 +72,67 @@ class FragmentManager:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _check_session(self) -> None:
-        """Background task: navigate to Fragment, check login + wallet status."""
+        """
+        Background task: open Fragment, check auth state, guide admin to log in.
+        The page stays open so the admin can complete the login manually.
+        After login/wallet connect, session is auto-saved by the persistent context.
+        """
         try:
             page = await self._context.new_page()
             info = await check_session(page)
             self.session_info = info
 
-            if info.logged_in and info.wallet_connected:
-                logger.info(str(info))
+            if info.fully_ready:
+                logger.info(
+                    f"Fragment ready ✓ | "
+                    f"TG: @{info.tg_username or '?'} | "
+                    f"Wallet: {info.wallet_address or '?'} | "
+                    f"Balance: {info.ton_balance or '?'} TON"
+                )
                 await page.close()
-            elif info.logged_in and not info.wallet_connected:
+                return
+
+            # Not fully authenticated — leave browser window open for manual login
+            if not info.logged_in:
                 logger.warning(
-                    "Fragment: залогинен, но TON кошелёк не подключён. "
-                    "Подключите кошелёк в открытом браузере."
+                    "Fragment: нужно войти через Telegram. "
+                    "В открытом браузере нажмите 'Connect Telegram'."
                 )
-                # Leave page open so admin can connect wallet
-            else:
+            elif not info.wallet_connected:
                 logger.warning(
-                    "Fragment: не авторизован. "
-                    "Войдите через Telegram в открытом браузере."
+                    "Fragment: Telegram подключён, но TON кошелёк не привязан. "
+                    "В открытом браузере нажмите 'Connect TON'."
                 )
-                # Leave page open for login
+
+            # Wait up to 5 minutes for the user to complete auth in the open window
+            logger.info("Ожидаю завершения авторизации в браузере (до 5 мин)...")
+            await self._wait_for_full_auth(page)
+
         except Exception as exc:
             logger.warning(f"Fragment session check error (non-fatal): {exc}")
+
+    async def _wait_for_full_auth(self, page, timeout_sec: int = 300) -> None:
+        """Poll Fragment every 5 seconds until fully authenticated or timeout."""
+        from .auth import _SELECTOR_CONNECT_TG, _SELECTOR_CONNECT_TON
+        import asyncio
+
+        for _ in range(timeout_sec // 5):
+            await asyncio.sleep(5)
+            try:
+                has_tg  = await page.locator(_SELECTOR_CONNECT_TG).count()  > 0
+                has_ton = await page.locator(_SELECTOR_CONNECT_TON).count() > 0
+                if not has_tg and not has_ton:
+                    # Fully connected — re-run full check to get details
+                    info = await check_session(page)
+                    self.session_info = info
+                    logger.info(
+                        f"Fragment авторизован ✓ | "
+                        f"TG: @{info.tg_username or '?'} | "
+                        f"Wallet: {info.wallet_address or '?'}"
+                    )
+                    await page.close()
+                    return
+            except Exception:
+                pass
+
+        logger.warning("Таймаут ожидания авторизации Fragment (5 мин). Перезапустите бота.")
