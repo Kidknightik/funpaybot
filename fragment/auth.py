@@ -17,15 +17,16 @@ async def get_browser_context(playwright):
     """
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-    proxy_settings = None
     if settings.FRAGMENT_PROXY:
-        # parse http://user:pass@host:port
         proxy_settings = {"server": settings.FRAGMENT_PROXY}
+    else:
+        # Force direct connection — prevents Edge from inheriting any system/profile proxy
+        proxy_settings = {"server": "direct://"}
 
     context = await playwright.chromium.launch_persistent_context(
         str(SESSION_DIR),
-        channel="msedge",         # use installed Microsoft Edge
-        headless=False,           # show window so admin can log in first time
+        channel="msedge",
+        headless=False,
         proxy=proxy_settings,
         viewport={"width": 1280, "height": 800},
         user_agent=(

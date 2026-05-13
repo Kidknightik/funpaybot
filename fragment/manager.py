@@ -33,15 +33,25 @@ class FragmentManager:
         self._gifter = FragmentGifter(self._context)
         logger.info("Fragment browser context started")
 
-        # Verify session
-        page = await self._context.new_page()
-        logged = await is_logged_in(page)
-        await page.close()
-        if not logged:
-            logger.warning(
-                "Fragment session not authenticated. "
-                "Please log in via the opened browser window."
-            )
+        # Schedule session check in background — don't block startup
+        asyncio.create_task(self._check_session())
+
+    async def _check_session(self) -> None:
+        """Background task: navigate browser to Fragment and warn if not logged in."""
+        try:
+            page = await self._context.new_page()
+            logged = await is_logged_in(page)
+            if logged:
+                logger.info("Fragment session is authenticated ✓")
+                await page.close()
+            else:
+                logger.warning(
+                    "Fragment not authenticated. "
+                    "Please log in via the opened browser window, then the session will be saved."
+                )
+                # Leave the page open so admin can log in manually
+        except Exception as exc:
+            logger.warning(f"Fragment session check error (non-fatal): {exc}")
 
     async def stop(self) -> None:
         if self._context:
