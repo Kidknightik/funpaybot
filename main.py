@@ -29,11 +29,12 @@ async def main() -> None:
     bot: Bot = create_bot()
     dp = create_dispatcher()
 
+    # ── Fragment browser ───────────────────────────────────────────────────────
     fragment = FragmentManager()
     await fragment.start()
-    set_fragment_manager(fragment)   # make manager available to Telegram handlers
+    set_fragment_manager(fragment)
 
-    # Notification helper for both FunPay chat and Telegram admin
+    # ── FunPay listener ────────────────────────────────────────────────────────
     async def send_funpay_message(chat_id: int, text: str) -> None:
         await funpay_listener.send_message(chat_id, text)
 
@@ -57,10 +58,11 @@ async def main() -> None:
         on_new_order=on_new_order,
         on_buyer_message=on_buyer_message,
         loop=loop,
+        fragment_ready=fragment.ready_event,   # gate order processing
     )
     await funpay_listener.start()
 
-    # Graceful shutdown
+    # ── Graceful shutdown ──────────────────────────────────────────────────────
     stop_event = asyncio.Event()
 
     def _handle_signal(*_):
@@ -74,7 +76,7 @@ async def main() -> None:
             pass  # Windows
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    await notify_admins(bot, "🚀 Бот запущен и готов к работе")
+    await notify_admins(bot, "Bot started and ready")
 
     # Run Telegram polling + wait for stop
     polling_task = asyncio.create_task(

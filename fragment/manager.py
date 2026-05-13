@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -26,15 +27,22 @@ class FragmentManager:
         self._gifter: Optional[FragmentGifter] = None
         self._lock = asyncio.Lock()
         self.session_info: Optional[FragmentSessionInfo] = None
+        # Set when session check finishes (ready OR timed out)
+        self._ready_event: asyncio.Event = asyncio.Event()
+
+    @property
+    def ready_event(self) -> asyncio.Event:
+        return self._ready_event
 
     async def start(self) -> None:
-        """Launch Playwright and open the persistent browser context."""
+        """Launch Playwright, clean stale locks, open the persistent browser context."""
+        self._clean_edge_locks()
         self._playwright = await async_playwright().start()
         self._context = await get_browser_context(self._playwright)
         self._gifter = FragmentGifter(self._context)
         logger.info("Fragment browser context started")
 
-        # Schedule full session check in background — don't block startup
+        # Schedule full session check — sets _ready_event when done
         asyncio.create_task(self._check_session())
 
     async def stop(self) -> None:
@@ -71,11 +79,27 @@ class FragmentManager:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _clean_edge_locks(self) -> None:
+        """Remove stale Edge profile lock files left by a crashed previous session."""
+        from .auth import SESSION_DIR
+        lock_paths = [
+            SESSION_DIR / "Default" / "LOCK",
+            SESSION_DIR / "SingletonLock",
+            SESSION_DIR / "SingletonCookie",
+            SESSION_DIR / "Default" / "SingletonLock",
+        ]
+        for p in lock_paths:
+            if p.exists():
+                try:
+                    p.unlink()
+                    logger.debug(f"Removed stale lock: {p.name}")
+                except Exception as exc:
+                    logger.warning(f"Could not remove lock {p}: {exc}")
+
     async def _check_session(self) -> None:
         """
-        Background task: open Fragment, check auth state, guide admin to log in.
-        The page stays open so the admin can complete the login manually.
-        After login/wallet connect, session is auto-saved by the persistent context.
+        Background task: check Fragment auth state.
+        Sets _ready_event when done (regardless of outcome).
         """
         try:
             page = await self._context.new_page()
@@ -84,37 +108,39 @@ class FragmentManager:
 
             if info.fully_ready:
                 logger.info(
-                    f"Fragment ready ✓ | "
+                    f"Fragment ready | "
                     f"TG: @{info.tg_username or '?'} | "
                     f"Wallet: {info.wallet_address or '?'} | "
                     f"Balance: {info.ton_balance or '?'} TON"
                 )
                 await page.close()
+                self._ready_event.set()
                 return
 
-            # Not fully authenticated — leave browser window open for manual login
             if not info.logged_in:
                 logger.warning(
-                    "Fragment: нужно войти через Telegram. "
-                    "В открытом браузере нажмите 'Connect Telegram'."
+                    "Fragment: need to log in via Telegram. "
+                    "Open browser and click 'Connect Telegram'."
                 )
             elif not info.wallet_connected:
                 logger.warning(
-                    "Fragment: Telegram подключён, но TON кошелёк не привязан. "
-                    "В открытом браузере нажмите 'Connect TON'."
+                    "Fragment: Telegram connected but TON wallet not linked. "
+                    "Click 'Connect TON' in the open browser."
                 )
 
-            # Wait up to 5 minutes for the user to complete auth in the open window
-            logger.info("Ожидаю завершения авторизации в браузере (до 5 мин)...")
+            logger.info("Waiting for Fragment auth (up to 5 min)...")
             await self._wait_for_full_auth(page)
 
         except Exception as exc:
             logger.warning(f"Fragment session check error (non-fatal): {exc}")
+        finally:
+            # Always unblock order processing, even if auth failed
+            self._ready_event.set()
+            logger.debug("Fragment ready_event set")
 
     async def _wait_for_full_auth(self, page, timeout_sec: int = 300) -> None:
-        """Poll Fragment every 5 seconds until fully authenticated or timeout."""
+        """Poll every 5 s until fully authenticated or timeout."""
         from .auth import _SELECTOR_CONNECT_TG, _SELECTOR_CONNECT_TON
-        import asyncio
 
         for _ in range(timeout_sec // 5):
             await asyncio.sleep(5)
@@ -122,11 +148,10 @@ class FragmentManager:
                 has_tg  = await page.locator(_SELECTOR_CONNECT_TG).count()  > 0
                 has_ton = await page.locator(_SELECTOR_CONNECT_TON).count() > 0
                 if not has_tg and not has_ton:
-                    # Fully connected — re-run full check to get details
                     info = await check_session(page)
                     self.session_info = info
                     logger.info(
-                        f"Fragment авторизован ✓ | "
+                        f"Fragment authenticated | "
                         f"TG: @{info.tg_username or '?'} | "
                         f"Wallet: {info.wallet_address or '?'}"
                     )
@@ -135,4 +160,8 @@ class FragmentManager:
             except Exception:
                 pass
 
-        logger.warning("Таймаут ожидания авторизации Fragment (5 мин). Перезапустите бота.")
+        logger.warning("Fragment auth timeout (5 min). Bot will still process orders but gifting may fail.")
+        try:
+            await page.close()
+        except Exception:
+            pass

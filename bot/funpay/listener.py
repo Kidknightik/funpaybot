@@ -31,10 +31,12 @@ class FunPayListener:
         on_new_order: Callable[[str, int, str, str, dict], Awaitable[None]],
         on_buyer_message: Callable[[int, str, str], Awaitable[None]],
         loop: asyncio.AbstractEventLoop,
+        fragment_ready: asyncio.Event | None = None,
     ) -> None:
         self._on_new_order = on_new_order
         self._on_buyer_message = on_buyer_message
         self._loop = loop
+        self._fragment_ready = fragment_ready
         self._account: FunPayAPI.Account | None = None
         self._runner: FunPayAPI.Runner | None = None
         self._order_task: asyncio.Task | None = None
@@ -101,9 +103,16 @@ class FunPayListener:
     async def _order_poll_loop(self) -> None:
         """
         Poll get_sells(state='paid') every 30 s.
-        New paid orders not yet in _seen_orders are dispatched.
+        Waits for Fragment to be ready before first order dispatch.
         """
         logger.info("FunPay order poller started")
+
+        # Wait until Fragment browser session is confirmed (ready or timed out)
+        if self._fragment_ready is not None:
+            logger.info("Waiting for Fragment session before processing orders...")
+            await self._fragment_ready.wait()
+            logger.info("Fragment ready — order processing started")
+
         while True:
             try:
                 await self._check_new_orders()
