@@ -24,6 +24,7 @@ async def get_browser_context(playwright):
 
     context = await playwright.chromium.launch_persistent_context(
         str(SESSION_DIR),
+        channel="msedge",         # use installed Microsoft Edge
         headless=False,           # show window so admin can log in first time
         proxy=proxy_settings,
         viewport={"width": 1280, "height": 800},
