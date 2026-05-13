@@ -17,11 +17,7 @@ async def get_browser_context(playwright):
     """
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-    if settings.FRAGMENT_PROXY:
-        proxy_settings = {"server": settings.FRAGMENT_PROXY}
-    else:
-        # Force direct connection — prevents Edge from inheriting any system/profile proxy
-        proxy_settings = {"server": "direct://"}
+    proxy_settings = {"server": settings.FRAGMENT_PROXY} if settings.FRAGMENT_PROXY else None
 
     context = await playwright.chromium.launch_persistent_context(
         str(SESSION_DIR),
